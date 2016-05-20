@@ -15,7 +15,16 @@
       <h1>ESRI Indexer</h1>
       <hr/>
       <h2>Index New Server</h2>
-      <form role="form" method='POST'>
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          <ul class="flashes">
+          {% for message in messages %}
+            <li>{{ message }}</li>
+          {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+      <form role="form" method="POST" action="{{ url_for('new_server') }}">
         <div class="form-group">
           {% if existing_url %}
           <input type="text" name="url" class="form-control" id="url-box" value="{{ existing_url }}" placeholder="Enter URL..." style="max-width: 500px;">

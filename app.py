@@ -1,23 +1,40 @@
 import os
 from sqlalchemy.exc import IntegrityError
 from flask.ext.sqlalchemy import SQLAlchemy
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, json, redirect, url_for, flash
 
-import redis
-from rq import Queue
+import boto.sqs
+from boto.sqs.message import RawMessage
+# import redis
+# from rq import Queue
 import requests
 
 from urlparse import urlparse
 from indexer import Indexer
 
+if os.environ.get('RDS_HOSTNAME'):
+    db_url = 'postgresql://{user}:{password}@{host}:{port}/{database}'.format(
+        user=os.environ.get('RDS_USERNAME'),
+        password=os.environ.get('RDS_PASSWORD'),
+        host=os.environ.get('RDS_HOSTNAME'),
+        port=os.environ.get('RDS_PORT'),
+        database=os.environ.get('RDS_DB_NAME'),
+    )
+else:
+    db_url = os.environ.get('HEROKU_POSTGRESQL_VIOLET_URL')
 
 app = Flask(__name__)
 app.config['DEBUG'] = True
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('HEROKU_POSTGRESQL_VIOLET_URL')
+app.config['SECRET_KEY'] = 'top secret key!'
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['REDIS_URL'] = os.environ.get('REDISTOGO_URL', 'redis://localhost:6379')
+app.config['AWS_REGION'] = os.environ.get('AWS_REGION')
+app.config['WORKER_QUEUE'] = os.environ.get('WORKER_QUEUE')
 db = SQLAlchemy(app)
-redis_conn = redis.from_url(app.config['REDIS_URL'])
-q = Queue(connection=redis_conn)
+# redis_conn = redis.from_url(app.config['REDIS_URL'])
+# q = Queue(connection=redis_conn)
+application = app
+sqs_conn = boto.sqs.connect_to_region(app.config['AWS_REGION'])
 
 from models import *
 
@@ -68,41 +85,56 @@ def index_esri_server(server_id):
     db.session.add(server)
     db.session.commit()
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    errors = []
+@app.route('/queue_handler', methods=['POST'])
+def queue_handler():
+    server_id = request.json.get('server_id')
+    app.logger.info("Starting indexing server %s", server_id)
 
-    errored_url = None
-    if request.method == 'POST':
-        url = request.form['url']
+    index_esri_server(server_id)
 
-        url_parts = urlparse(url)
+    app.logger.info("Done indexing server %s", server_id)
 
-        if url_parts.scheme not in ('http', 'https'):
-            errors.append('That URL is not valid.')
-            errored_url = url
-        else:
-            server = EsriServer(url=url)
+    return "ok", 200
+
+@app.route('/servers/new', methods=['POST'])
+def new_server():
+    url = request.form['url']
+
+    url_parts = urlparse(url)
+
+    if url_parts.scheme not in ('http', 'https'):
+        flash('That URL is not valid.')
+    else:
+        server = EsriServer(url=url)
+        db.session.add(server)
+        try:
+            db.session.commit()
+
+            message = {
+                "server_id": server.id
+            }
+            m = RawMessage()
+            m.set_body(json.dumps(message))
+            queue = boto.sqs.queue.Queue(sqs_conn, app.config['WORKER_QUEUE'])
+            queue.write(m)
+
+            server.status = 'queued'
             db.session.add(server)
-            try:
-                db.session.commit()
+            db.session.commit()
+        except IntegrityError:
+            flash('That URL has already been added.')
+            db.session.rollback()
 
-                job = q.enqueue_call(
-                    func='app.index_esri_server',
-                    args=(server.id,),
-                    result_ttl=5000,
-                )
+    return redirect(url_for('index'))
 
-                server.status = 'queued'
-                server.job_id = job.get_id()
-                db.session.add(server)
-                db.session.commit()
-            except IntegrityError:
-                errors.append('That URL has already been added.')
+@app.route('/')
+def index():
+    servers = EsriServer\
+        .query \
+        .order_by('updated_at DESC') \
+        .paginate(page=int(request.args.get('page', 1)))
 
-    servers = EsriServer.query.paginate(page=int(request.args.get('page', 1)))
-
-    return render_template('index.html', servers=servers, errors=errors, errored_url=errored_url)
+    return render_template('index.html', servers=servers)
 
 @app.route('/servers/<int:server_id>', methods=['GET'])
 def show_server(server_id):

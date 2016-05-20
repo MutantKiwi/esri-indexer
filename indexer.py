@@ -1,4 +1,5 @@
 import requests
+from flask import json
 
 class Indexer(object):
     def __init__(self, logger=None):
@@ -32,7 +33,9 @@ class Indexer(object):
         response = requests.get(service_url, params=dict(f='json'))
         self.logger.debug('HTTP %s %s: %s', response.request.method, response.url, response.status_code)
         response.raise_for_status()
-        return response.json()
+        data = response.text
+        data = data.replace('NaN', '"NaN"')
+        return json.loads(data)
 
 if __name__ == '__main__':
     indexer = Indexer()
